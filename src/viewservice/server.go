@@ -16,17 +16,45 @@ type ViewServer struct {
 	rpccount int32 // for testing
 	me       string
 
-
-	// Your declarations here.
+	//my declare
+	view         View
+	pingDic      map[string]time.Time
+	acked        bool
+	secondBackup string
 }
 
 //
 // server Ping RPC handler.
 //
+
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
-	// Your code here.
+	client := args.Me
+	viewNum := args.Viewnum
 
+	vs.pingDic[client] = time.Now()
+
+	if client == vs.view.Primary {
+		if viewNum == 0 {
+			vs.swap(vs.view.Backup, vs.secondBackup, client)
+			//vs.swap(vs.view.Backup, client, vs.secondBackup) // this also works
+		} else if vs.view.Viewnum == viewNum {
+			vs.acked = true
+		}
+	} else if client == vs.view.Backup {
+		if viewNum == 0 && vs.acked {
+			vs.swap(vs.view.Primary, vs.secondBackup, client)
+		}
+	} else {
+		if vs.view.Viewnum == 0 {
+			vs.swap(client, "", "")
+		} else {
+			vs.secondBackup = client
+		}
+	}
+	reply.View = vs.view
 	return nil
 }
 
@@ -34,21 +62,42 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 // server Get() RPC handler.
 //
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
-
-	// Your code here.
-
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	reply.View = vs.view
 	return nil
 }
-
 
 //
 // tick() is called once per PingInterval; it should notice
 // if servers have died or recovered, and change the view
 // accordingly.
 //
-func (vs *ViewServer) tick() {
 
-	// Your code here.
+func (vs *ViewServer) tick() {
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	maxDelay := DeadPings * PingInterval
+
+	if vs.acked && time.Now().Sub(vs.pingDic[vs.view.Backup]) >= maxDelay {
+		vs.swap(vs.view.Primary, vs.secondBackup, "")
+	}
+	if vs.acked && time.Now().Sub(vs.pingDic[vs.view.Primary]) >= maxDelay {
+		vs.swap(vs.view.Backup, vs.secondBackup, "")
+	}
+
+	if time.Now().Sub(vs.pingDic[vs.secondBackup]) >= maxDelay {
+		vs.secondBackup = ""
+	}
+
+}
+
+func (vs *ViewServer) swap(primary string, backup string, secondBackup string) {
+	vs.view.Viewnum++
+	vs.view.Primary = primary
+	vs.view.Backup = backup
+	vs.secondBackup = secondBackup
+	vs.acked = false
 }
 
 //
@@ -77,6 +126,9 @@ func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
 	// Your vs.* initializations here.
+	vs.view = View{Primary: "", Backup: "", Viewnum: 0}
+	vs.pingDic = make(map[string]time.Time)
+	vs.acked = false
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
