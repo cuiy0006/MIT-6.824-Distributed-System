@@ -11,8 +11,7 @@ import "sync/atomic"
 import "os"
 import "syscall"
 import "math/rand"
-
-
+import "errors"
 
 type PBServer struct {
 	mu         sync.Mutex
@@ -22,35 +21,145 @@ type PBServer struct {
 	me         string
 	vs         *viewservice.Clerk
 	// Your declarations here.
+	view     viewservice.View
+	keyValue map[string]string
+	lastArgs map[int64]PAGArgs
 }
 
-
-func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
-
+func (pb *PBServer) Get(args *PAGArgs, reply *CommonReply) error {
 	// Your code here.
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	// The server isn't the active primary
+	if pb.me != pb.view.Primary {
+		reply.Err = "I am not primary"
+		return nil
+	}
+	//success! get key, value from dictionary
+	reply.Value = pb.keyValue[args.Key]
 
 	return nil
 }
 
-
-func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+func (pb *PBServer) PutAppend(args *PAGArgs, reply *CommonReply) error {
 
 	// Your code here.
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
 
+	// The server isn't the active primary
+	if pb.me != pb.view.Primary {
+		reply.Err = "I am not primary"
+		return nil
+	}
+	// If the operation is the last operation, then cancel it
+	if *args == pb.lastArgs[args.OpId] {
+		reply.Err = ""
+		return nil
+	}
+	// record this operation Id and args
+	pb.lastArgs[args.OpId] = *args
 
+	//primary finished, let primary start
+	backupReply := CommonReply{}
+	for pb.view.Backup != "" {
+		backupReply.Err = ""
+		ok := call(pb.view.Backup, "PBServer.PutAppendBackup", args, &backupReply)
+		if ok && backupReply.Err == "" {
+			break
+		}
+		time.Sleep(viewservice.PingInterval)
+	}
+
+	//success! put key, value in dictionary
+	if args.Operation == "Put" {
+		pb.keyValue[args.Key] = args.Value
+	} else if args.Operation == "Append" {
+		pb.keyValue[args.Key] += args.Value
+	} else {
+		return errors.New("Only Put or Append is accepted")
+	}
 	return nil
 }
-
 
 //
-// ping the viewserver periodically.
+//put or append
+//
+func (pb *PBServer) PutAppendBackup(args *PAGArgs, reply *CommonReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	//return if this is not a backup now
+	if pb.me != pb.view.Backup {
+		reply.Err = "I am not backup any more"
+		return nil
+	}
+
+	//return if this operation is the last operation
+	if *args == pb.lastArgs[args.OpId] {
+		reply.Err = ""
+		return nil
+	}
+	// record this operation Id and args
+	pb.lastArgs[args.OpId] = *args
+
+	//success! put key, value in dictionary
+	if args.Operation == "Put" {
+		pb.keyValue[args.Key] = args.Value
+	}
+	if args.Operation == "Append" {
+		pb.keyValue[args.Key] += args.Value
+	}
+
+	return nil
+}
+
+//
+// executed in backup server, update keyValue and lastArgs
+//
+func (pb *PBServer) ReproduceBackup(args *InitBackupArgs, reply *CommonReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	pb.keyValue = args.KeyValue
+	pb.lastArgs = args.LastArgs
+
+	return nil
+}
+
+//
+// ping the viewserver to acknowlege alive.
 // if view changed:
-//   transition to new view.
-//   manage transfer of state from primary to new backup.
+//   update my view
+//   if I am primary, update backup's keyValue, lastArgs
 //
 func (pb *PBServer) tick() {
 
 	// Your code here.
+	view, _ := pb.vs.Ping(pb.view.Viewnum)
+	oldview := pb.view
+	pb.view = view
+
+	// if view changed, do some operations
+	if oldview.Viewnum != view.Viewnum {
+		// if current server is primary and backup changed, initialize it
+		pb.mu.Lock()
+
+		args := &InitBackupArgs{
+			KeyValue: pb.keyValue,
+			LastArgs: pb.lastArgs,
+		}
+		reply := CommonReply{}
+		//update backup's lastArgs and keyValue storage
+		for pb.me == view.Primary && view.Backup != oldview.Backup && view.Backup != "" {
+			ok := call(pb.view.Backup, "PBServer.ReproduceBackup", args, &reply)
+			if ok && reply.Err == "" {
+				break
+			}
+		}
+		pb.mu.Unlock()
+	}
 }
 
 // tell the server to shut itself down.
@@ -78,12 +187,13 @@ func (pb *PBServer) isunreliable() bool {
 	return atomic.LoadInt32(&pb.unreliable) != 0
 }
 
-
 func StartServer(vshost string, me string) *PBServer {
 	pb := new(PBServer)
 	pb.me = me
 	pb.vs = viewservice.MakeClerk(me, vshost)
 	// Your pb.* initializations here.
+	pb.keyValue = make(map[string]string)
+	pb.lastArgs = make(map[int64]PAGArgs)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)

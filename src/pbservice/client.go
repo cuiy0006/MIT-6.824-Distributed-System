@@ -1,16 +1,16 @@
 package pbservice
 
-import "viewservice"
-import "net/rpc"
-import "fmt"
-
-import "crypto/rand"
-import "math/big"
-
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
+	"viewservice"
+)
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// Your declarations here
+	primary string
 }
 
 // this may come in handy.
@@ -25,43 +25,7 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
-
 	return ck
-}
-
-
-//
-// call() sends an RPC to the rpcname handler on server srv
-// with arguments args, waits for the reply, and leaves the
-// reply in reply. the reply argument should be a pointer
-// to a reply structure.
-//
-// the return value is true if the server responded, and false
-// if call() was not able to contact the server. in particular,
-// the reply's contents are only valid if call() returned true.
-//
-// you should assume that call() will return an
-// error after a while if the server is dead.
-// don't provide your own time-out mechanism.
-//
-// please use call() to send all RPCs, in client.go and server.go.
-// please don't change this function.
-//
-func call(srv string, rpcname string,
-	args interface{}, reply interface{}) bool {
-	c, errx := rpc.Dial("unix", srv)
-	if errx != nil {
-		return false
-	}
-	defer c.Close()
-
-	err := c.Call(rpcname, args, reply)
-	if err == nil {
-		return true
-	}
-
-	fmt.Println(err)
-	return false
 }
 
 //
@@ -74,8 +38,25 @@ func call(srv string, rpcname string,
 func (ck *Clerk) Get(key string) string {
 
 	// Your code here.
+	// still don't know who is the primary
+	for ck.primary == "" {
+		ck.UpdatePrimary()
+		time.Sleep(viewservice.PingInterval)
+	}
 
-	return "???"
+	args := &PAGArgs{Key: key, Operation: "Get", OpId: nrand()}
+	reply := CommonReply{}
+
+	ok := call(ck.primary, "PBServer.Get", args, &reply)
+
+	for !ok || reply.Err != "" {
+		time.Sleep(viewservice.PingInterval)
+		reply.Err = ""
+		ck.UpdatePrimary()
+		ok = call(ck.primary, "PBServer.Get", args, &reply)
+	}
+
+	return reply.Value
 }
 
 //
@@ -84,6 +65,24 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	// Your code here.
+	// still don't know who is the primary
+	for ck.primary == "" {
+		ck.UpdatePrimary()
+		time.Sleep(viewservice.PingInterval)
+	}
+
+	args := &PAGArgs{Key: key, Value: value, Operation: op, OpId: nrand()}
+	reply := CommonReply{}
+
+	ok := call(ck.primary, "PBServer.PutAppend", args, &reply)
+
+	for !ok || reply.Err != "" {
+		time.Sleep(viewservice.PingInterval)
+		reply.Err = ""
+		ck.UpdatePrimary()
+		ok = call(ck.primary, "PBServer.PutAppend", args, &reply)
+	}
+
 }
 
 //
@@ -100,4 +99,9 @@ func (ck *Clerk) Put(key string, value string) {
 //
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+// used for clerk to update primary
+func (ck *Clerk) UpdatePrimary() {
+	ck.primary = ck.vs.Primary()
 }
