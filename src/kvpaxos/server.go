@@ -11,7 +11,7 @@ import "os"
 import "syscall"
 import "encoding/gob"
 import "math/rand"
-
+import "time"
 
 const Debug = 0
 
@@ -22,11 +22,14 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Op    string
+	OpId  int64
+	Key   string
+	Value string
 }
 
 type KVPaxos struct {
@@ -38,17 +41,113 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// Your definitions here.
+	keyValue map[string]string
+	history  map[int64]bool
+	currSeq  int
 }
 
+//only return when sequence NO is decided by all servers
+func (kv *KVPaxos) waitForDecided(seq int) Op {
+	to := 10 * time.Millisecond
+	for {
+		status, v := kv.px.Status(seq)
+		if status == paxos.Decided {
+			return v.(Op)
+		}
+		time.Sleep(to)
+		if to < 10*time.Second {
+			to *= 2
+		}
+	}
+}
+
+// local variable changes
+func (kv *KVPaxos) doLocalStore(v Op) {
+	//put/append value in local data storage
+	if v.Op == PUT {
+		kv.keyValue[v.Key] = v.Value
+	} else if v.Op == APPEND {
+		if curr, exist := kv.keyValue[v.Key]; exist {
+			kv.keyValue[v.Key] = curr + v.Value
+		} else {
+			kv.keyValue[v.Key] = v.Value
+		}
+	}
+
+	// record operation ID
+	kv.history[v.OpId] = true
+}
+
+func (kv *KVPaxos) doOperation(v Op) {
+	var remoteValue Op
+	for {
+
+		// for current sequence NO I have, is it pending or decided?
+		status, val := kv.px.Status(kv.currSeq)
+
+		// if decided, save it locally, else, start prepare/accept this seq with my v
+		if status == paxos.Decided {
+			remoteValue = val.(Op)
+		} else {
+			kv.px.Start(kv.currSeq, v)
+			remoteValue = kv.waitForDecided(kv.currSeq)
+		}
+
+		// store the decided v by all servers in local keyValue map, record its operation ID
+		kv.doLocalStore(remoteValue)
+		// this sequence number is done for me
+		kv.px.Done(kv.currSeq)
+		// new sequence number
+		kv.currSeq++
+
+		// if the decided value is not my v, use new sequence NO and try my v again
+		if v.OpId == remoteValue.OpId {
+			break
+		}
+	}
+}
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	//keep at most once
+	if _, exist := kv.history[args.OpId]; exist {
+		reply.Err = ErrOpExist
+	} else {
+		GetOp := Op{Op: GET, Key: args.Key, OpId: args.OpId}
+		kv.doOperation(GetOp)
+	}
+
+	//anyway, return a value
+	if val, exist := kv.keyValue[args.Key]; exist {
+		reply.Value = val
+	} else {
+		reply.Err = ErrNoKey
+		reply.Value = ""
+	}
+
+	if reply.Err == "" {
+		reply.Err = OK
+	}
+
 	return nil
 }
 
 func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 
+	//keep at most once
+	if _, exist := kv.history[args.OpId]; exist {
+		reply.Err = ErrOpExist
+	} else {
+		appendOp := Op{Op: args.Op, OpId: args.OpId, Key: args.Key, Value: args.Value}
+		kv.doOperation(appendOp)
+		reply.Err = OK
+	}
 	return nil
 }
 
@@ -94,6 +193,9 @@ func StartServer(servers []string, me int) *KVPaxos {
 	kv.me = me
 
 	// Your initialization code here.
+	kv.keyValue = make(map[string]string)
+	kv.history = make(map[int64]bool)
+	kv.currSeq = 1
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
@@ -106,7 +208,6 @@ func StartServer(servers []string, me int) *KVPaxos {
 		log.Fatal("listen error: ", e)
 	}
 	kv.l = l
-
 
 	// please do not change any of the following code,
 	// or do anything to subvert it.
